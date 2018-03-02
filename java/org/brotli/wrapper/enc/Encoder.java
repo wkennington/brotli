@@ -10,6 +10,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.WritableByteChannel;
 import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Base class for OutputStream / Channel implementations.
@@ -20,6 +21,7 @@ public class Encoder {
   final ByteBuffer inputBuffer;
   ByteBuffer buffer;
   boolean closed;
+  List<PreparedDictionary> nativeDictionaries;
 
   /**
    * Brotli encoder settings.
@@ -73,6 +75,7 @@ public class Encoder {
     if (destination == null) {
       throw new NullPointerException("destination can not be null");
     }
+    this.nativeDictionaries = new ArrayList<PreparedDictionary>();
     this.destination = destination;
     this.encoder = new EncoderJNI.Wrapper(inputBufferSize, params.quality, params.lgwin);
     this.inputBuffer = this.encoder.getInputBuffer();
@@ -85,6 +88,16 @@ public class Encoder {
       /* Ignore */
     }
     throw new IOException(message);
+  }
+
+  public void attachDictionary(PreparedDictionary dictionary) throws IOException {
+    if (!encoder.attachDictionary(dictionary.data)) {
+      fail("failed to attach dictionary");
+    }
+    // Only byte buffer is held by native encoder -> reference to wrapper should be held here.
+    if (dictionary.isNative) {
+      nativeDictionaries.add(dictionary);
+    }
   }
 
   /**
@@ -194,5 +207,13 @@ public class Encoder {
 
   public static byte[] compress(byte[] data) throws IOException {
     return compress(data, new Parameters());
+  }
+
+  public static PreparedDictionary prepareDictionary(ByteBuffer dictionary) {
+    ByteBuffer data = EncoderJNI.prepareDictionary(dictionary);
+    if (data == null) {
+      throw new IllegalStateException("OOM");
+    }
+    return new PreparedDictionary(data, true);
   }
 }

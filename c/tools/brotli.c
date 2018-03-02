@@ -94,6 +94,7 @@ typedef struct {
   BROTLI_BOOL test_integrity;
   BROTLI_BOOL decompress;
   const char* output_path;
+  const char* dictionary_path;
   const char* suffix;
   int not_input_indices[MAX_OPTIONS];
   size_t longest_path_len;
@@ -102,6 +103,9 @@ typedef struct {
   /* Inner state */
   int argc;
   char** argv;
+  uint8_t* dictionary;
+  size_t dictionary_size;
+  BrotliEncoderPreparedDictionary* prepared_dictionary;
   char* modified_path;  /* Storage for path with appended / cut suffix */
   int iterator;
   int ignore;
@@ -292,6 +296,9 @@ static Command ParseParams(Context* params) {
           if (params->lgwin != 0 && params->lgwin < BROTLI_MIN_WINDOW_BITS) {
             return COMMAND_INVALID;
           }
+        } else if (c == 'D') {
+          if (params->dictionary_path) return COMMAND_INVALID;
+          params->dictionary_path = argv[i];
         } else if (c == 'S') {
           if (suffix_set) return COMMAND_INVALID;
           suffix_set = BROTLI_TRUE;
@@ -346,7 +353,10 @@ static Command ParseParams(Context* params) {
         if (!value || value[1] == 0) return COMMAND_INVALID;
         key_len = (size_t)(value - arg);
         value++;
-        if (strncmp("lgwin", arg, key_len) == 0) {
+        if (strncmp("dictionary", arg, key_len) == 0) {
+          if (params->dictionary_path) return COMMAND_INVALID;
+          params->dictionary_path = value;
+        } else if (strncmp("lgwin", arg, key_len) == 0) {
           if (lgwin_set) return COMMAND_INVALID;
           lgwin_set = ParseInt(value, 0,
                                BROTLI_MAX_WINDOW_BITS, &params->lgwin);
@@ -425,7 +435,8 @@ static void PrintHelp(const char* name) {
           BROTLI_MIN_WINDOW_BITS, BROTLI_MAX_WINDOW_BITS);
   fprintf(stdout,
 "                              window size = 2**NUM - 16\n"
-"                              0 lets compressor choose the optimal value\n");
+"                              0 lets compressor choose the optimal value\n"
+"  -D FILE, --dictionary=FILE  use FILE as raw (LZ77) dictionary\n");
   fprintf(stdout,
 "  -S SUF, --suffix=SUF        output file suffix (default:'%s')\n",
           DEFAULT_SUFFIX);
@@ -528,6 +539,69 @@ static void CopyStat(const char* input_path, const char* output_path) {
     fprintf(stderr, "setting user failed for [%s]: %s\n",
             PrintablePath(output_path), strerror(errno));
   }
+}
+
+/* Result ownership is passed to caller.
+   |*dictionary_size| is set to resulting buffer size. */
+static BROTLI_BOOL ReadDictionary(Context* context, Command command) {
+  static const int kMaxDictionarySize =
+      BROTLI_MAX_DISTANCE - BROTLI_MAX_BACKWARD_LIMIT(24);
+  FILE* f;
+  int64_t file_size_64;
+  uint8_t* buffer;
+  size_t bytes_read;
+
+  if (context->dictionary_path == NULL) return BROTLI_TRUE;
+  f = fopen(context->dictionary_path, "rb");
+  if (f == NULL) {
+    fprintf(stderr, "failed to open dictionary file [%s]: %s\n",
+            PrintablePath(context->dictionary_path), strerror(errno));
+    return BROTLI_FALSE;
+  }
+
+  file_size_64 = FileSize(context->dictionary_path);
+  if (file_size_64 == -1) {
+    fprintf(stderr, "could not get size of dictionary file [%s]",
+            PrintablePath(context->dictionary_path));
+    fclose(f);
+    return BROTLI_FALSE;
+  }
+
+  if (file_size_64 > kMaxDictionarySize) {
+    fprintf(stderr, "dictionary [%s] is larger than maximum allowed: %d\n",
+            PrintablePath(context->dictionary_path), kMaxDictionarySize);
+    fclose(f);
+    return BROTLI_FALSE;
+  }
+  context->dictionary_size = (size_t)file_size_64;
+
+  buffer = (uint8_t*)malloc(context->dictionary_size);
+  if (!buffer) {
+    fprintf(stderr, "could not read dictionary: out of memory\n");
+    fclose(f);
+    return BROTLI_FALSE;
+  }
+  bytes_read = fread(buffer, sizeof(uint8_t), context->dictionary_size, f);
+  if (bytes_read != context->dictionary_size) {
+    free(buffer);
+    fprintf(stderr, "failed to read dictionary [%s]: %s\n",
+            PrintablePath(context->dictionary_path), strerror(errno));
+    fclose(f);
+    return BROTLI_FALSE;
+  }
+  fclose(f);
+  context->dictionary = buffer;
+  if (command == COMMAND_COMPRESS) {
+    context->prepared_dictionary = BrotliEncoderPrepareDictionary(
+        context->dictionary, context->dictionary_size, 0, BROTLI_MAX_QUALITY,
+        NULL, NULL, NULL);
+    if (context->prepared_dictionary == NULL) {
+      fprintf(stderr, "failed to prepare dictionary [%s]\n",
+              PrintablePath(context->dictionary_path));
+      return BROTLI_FALSE;
+    }
+  }
+  return BROTLI_TRUE;
 }
 
 static BROTLI_BOOL NextFile(Context* context) {
@@ -744,6 +818,10 @@ static BROTLI_BOOL DecompressFiles(Context* context) {
       fprintf(stderr, "out of memory\n");
       return BROTLI_FALSE;
     }
+    if (context->dictionary) {
+      BrotliDecoderAttachDictionary(s, BROTLI_SHARED_DICTIONARY_RAW,
+          context->dictionary, context->dictionary_size);
+    }
     is_ok = OpenFiles(context);
     if (is_ok && !context->current_input_path &&
         !context->force_overwrite && isatty(STDIN_FILENO)) {
@@ -821,6 +899,9 @@ static BROTLI_BOOL CompressFiles(Context* context) {
           (uint32_t)context->input_file_length : (1u << 30);
       BrotliEncoderSetParameter(s, BROTLI_PARAM_SIZE_HINT, size_hint);
     }
+    if (context->dictionary) {
+      BrotliEncoderAttachPreparedDictionary(s, context->prepared_dictionary);
+    }
     is_ok = OpenFiles(context);
     if (is_ok && !context->current_output_path &&
         !context->force_overwrite && isatty(STDOUT_FILENO)) {
@@ -851,6 +932,7 @@ int main(int argc, char** argv) {
   context.write_to_stdout = BROTLI_FALSE;
   context.decompress = BROTLI_FALSE;
   context.output_path = NULL;
+  context.dictionary_path = NULL;
   context.suffix = DEFAULT_SUFFIX;
   for (i = 0; i < MAX_OPTIONS; ++i) context.not_input_indices[i] = 0;
   context.longest_path_len = 1;
@@ -858,6 +940,9 @@ int main(int argc, char** argv) {
 
   context.argc = argc;
   context.argv = argv;
+  context.dictionary = NULL;
+  context.dictionary_size = 0;
+  context.prepared_dictionary = NULL;
   context.modified_path = NULL;
   context.iterator = 0;
   context.ignore = 0;
@@ -872,6 +957,7 @@ int main(int argc, char** argv) {
 
   if (command == COMMAND_COMPRESS || command == COMMAND_DECOMPRESS ||
       command == COMMAND_TEST_INTEGRITY) {
+    if (!ReadDictionary(&context, command)) is_ok = BROTLI_FALSE;
     if (is_ok) {
       size_t modified_path_len =
           context.longest_path_len + strlen(context.suffix) + 1;
@@ -916,6 +1002,8 @@ int main(int argc, char** argv) {
 
   if (context.iterator_error) is_ok = BROTLI_FALSE;
 
+  BrotliEncoderDestroyPreparedDictionary(context.prepared_dictionary);
+  free(context.dictionary);
   free(context.modified_path);
   free(context.buffer);
 
